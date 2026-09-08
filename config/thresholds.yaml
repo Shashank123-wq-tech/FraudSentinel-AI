@@ -1,0 +1,11 @@
+phase1:
+
+  operating_threshold: 0.84
+
+  threshold_type: fixed
+
+  threshold_selection_metric: f1
+
+  threshold_selection_dataset: validation
+
+  test_threshold_tuning: false

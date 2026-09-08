@@ -1,0 +1,508 @@
+# ============================================================
+# FraudSentinel AI
+# PHASE 2 — Temporal / Fraud-Spike Intelligence
+# ============================================================
+
+pipeline:
+  version: phase2_pipeline_v4
+  detector_version: phase2_detector_v4
+  timezone: UTC
+  random_seed: 42
+
+input:
+  phase1_risk_output: artifacts/phase1/risk_output/transaction_risk.csv
+
+schema:
+  required_columns:
+    - transaction_id
+    - timestamp
+    - merchant_id
+    - card_id
+    - amount
+    - fraud_probability
+    - risk_score
+    - risk_band
+    - predicted_fraud
+    - model_version
+    - threshold
+
+
+# ============================================================
+# MULTI-RESOLUTION WINDOWS
+# ============================================================
+
+windows:
+  sizes_minutes: [5, 15, 60]
+  event_window_minutes: 15
+
+
+# ============================================================
+# MERCHANT BASELINE
+# ============================================================
+
+baseline:
+  lookback_hours: 24
+  min_history_windows: 6
+  shrinkage_kappa: 50.0
+  epsilon: 1.0e-9
+
+  # Use global fallback during merchant cold-start periods.
+  warmup_policy: fallback_global
+
+  # Prevent unstable robust-scale calculations.
+  robust_scale_floor: 1.0e-6
+
+  # Prevent pathological tiny expected-fraud denominators.
+  min_baseline_expected_amount: 0.05
+
+
+# ============================================================
+# TEMPORAL / FINANCIAL FEATURES
+# ============================================================
+
+features:
+  risk_rate:
+    enabled: true
+
+  loss_per_txn:
+    enabled: true
+
+  risk_gmv_share:
+    enabled: true
+
+  expected_fraud_count:
+    enabled: true
+
+  expected_fraud_amount:
+    enabled: true
+
+  amount:
+    enabled: true
+
+  transaction_count:
+    enabled: true
+
+  unique_cards:
+    enabled: true
+
+  new_cards:
+    enabled: true
+
+
+# ============================================================
+# TEMPORAL ANOMALY SCORE
+# ============================================================
+
+scoring:
+  intensity_weight: 0.30
+  persistence_weight: 0.30
+  acceleration_weight: 0.10
+  breadth_weight: 0.10
+  financial_weight: 0.20
+
+  transform_tau: 2.5
+
+  # Maximum normalized contribution of an individual component.
+  max_component: 1.0
+
+  # Runtime validation.
+  require_weights_sum_to_one: true
+
+
+# ============================================================
+# BREADTH / ATTACK SURFACE
+# ============================================================
+
+breadth:
+  card_saturation: 8.0
+  tx_saturation: 10.0
+  volume_activation: 3.0
+
+  new_card_weight: 0.60
+  unique_card_weight: 0.40
+
+  minimum_transactions_for_full_activation: 5
+
+  enabled: true
+
+
+# ============================================================
+# PERSISTENCE
+# ============================================================
+
+persistence:
+  decay: 0.85
+  evidence_threshold: 0.20
+  accumulation_step: 0.25
+  reset_penalty: 0.10
+
+  # Persistence evidence thresholds.
+  verified_threshold: 0.45
+  critical_threshold: 0.70
+
+  enabled: true
+
+
+# ============================================================
+# ACCELERATION
+#
+# IMPORTANT:
+# Acceleration must be calculated from BASE TAS.
+# It must NOT use intensity_evidence_raw as the TAS source.
+# ============================================================
+
+acceleration:
+  enabled: true
+
+  # Explicit source for TAS acceleration.
+  tas_base_column: tas_base
+
+  min_previous_tas: 5.0
+
+  max_delta_for_full_score: 30.0
+
+  require_activity_gate: true
+
+  # Optional stabilization controls.
+  deadband: 0.0
+  smoothing_alpha: 1.0
+
+
+# ============================================================
+# FINANCIAL MATERIALITY
+# ============================================================
+
+materiality:
+  enabled: true
+
+  tau_expected_fraud_amount: 25.0
+
+  # Candidate gate.
+  candidate_min: 0.05
+
+  # Verified gate.
+  verified_min: 0.10
+
+  # Critical gate.
+  critical_min: 0.45
+
+  # Exceptional evidence.
+  exceptional_min_expected_fraud_amount: 250.0
+  exceptional_min_tas: 45
+
+
+# ============================================================
+# VERIFICATION
+# ============================================================
+
+verification:
+  enabled: true
+
+  candidate_tas: 35.0
+
+  # Verified windows must satisfy TAS >= 48.
+  verified_tas: 45.0
+
+  # Critical windows must satisfy TAS >= 70.
+  critical_tas: 70.0
+
+  min_history_confidence: 0.35
+
+  persistence_min: 0.30
+
+  corroboration_min: 0.25
+
+  minimum_transactions: 2
+
+  allow_single_txn_exception: true
+
+  # A single-transaction window cannot normally become
+  # verified solely from materiality unless exceptional
+  # evidence conditions are met.
+  single_txn_max_materiality_without_exception: 0.90
+  evidence_score_min: 0.35
+  critical_evidence_score_min: 0.60
+
+  breadth_score_min: 0.05
+
+  minimum_temporal_evidence: 2
+
+  # Explicit runtime requirements.
+  require_verified_tas: true
+  require_critical_tas: true
+  require_materiality: true
+  require_history_confidence: true
+
+
+# ============================================================
+# MULTISCALE CORROBORATION
+#
+# 5m  = fast burst evidence
+# 15m = primary event resolution
+# 60m = slow contextual evidence
+# ============================================================
+
+multiscale:
+  enabled: true
+
+  fast_weight: 0.45
+  medium_weight: 0.35
+  slow_weight: 0.20
+
+  redundancy_penalty_fast_medium: 0.70
+  redundancy_penalty_medium_slow: 0.80
+
+  minimum_incremental_signal: 0.10
+
+
+# ============================================================
+# HYSTERESIS
+# ============================================================
+
+hysteresis:
+  high_enter: 40.0
+  high_exit: 32.0
+
+  critical_enter: 70.0
+  critical_exit: 58.0
+
+  max_gap_minutes: 15
+
+
+# ============================================================
+# FRAUD ATTACK SCORE
+# ============================================================
+
+fraud_attack_score:
+  enabled: true
+
+  # Attack score is produced after verification evidence.
+  use_verification_score: true
+
+  use_materiality: true
+
+  attack_gamma: 1.0
+
+
+# ============================================================
+# EVENT / ALERT CONSTRUCTION
+# ============================================================
+
+alerts:
+  enabled: true
+
+  max_event_gap_minutes: 15
+
+  merge_same_merchant_events: true
+
+  minimum_event_windows: 2
+
+  minimum_verified_windows: 1
+
+  allow_exceptional_single_window: true
+
+  # A candidate episode must contain a verified anchor
+  # unless an exceptional single-window rule is triggered.
+  require_verified_anchor: true
+
+  # Episode formation should begin from candidate windows,
+  # then require a verified anchor.
+  use_candidate_windows_for_episode: true
+
+
+# ============================================================
+# EVENT AGGREGATION
+# ============================================================
+
+events:
+  enabled: true
+
+  event_window_minutes: 15
+
+  max_event_gap_minutes: 15
+
+  minimum_event_windows: 2
+
+  minimum_verified_windows: 1
+
+  allow_exceptional_single_window: true
+
+  require_verified_anchor: true
+
+  use_candidate_windows_for_episode: true
+
+  # Peak event evidence.
+  peak_score:
+    primary: fraud_attack_score
+    fallback: tas
+
+  # Event-level card aggregation.
+  unique_cards_aggregation: union
+
+  new_cards_aggregation: union
+
+
+# ============================================================
+# EVENT SEVERITY
+# ============================================================
+
+severity:
+  verified_tas: 48.0
+  critical_tas: 70.0
+
+  verified_materiality: 0.10
+  critical_materiality: 0.45
+
+  verified_state: VERIFIED_FRAUD_SPIKE
+  critical_state: CRITICAL_FRAUD_SPIKE
+
+
+# ============================================================
+# EVENT METRICS
+# ============================================================
+
+event_metrics:
+  expected_fraud_amount:
+    enabled: true
+
+  baseline_expected_fraud_amount:
+    enabled: true
+
+  spike_ratio:
+    enabled: true
+
+    # Explicit handling when baseline expected fraud amount
+    # is zero or extremely small.
+    zero_baseline_policy: explicit
+
+  transaction_count:
+    enabled: true
+
+  unique_cards:
+    enabled: true
+
+  new_cards:
+    enabled: true
+
+
+# ============================================================
+# EXPLANATIONS
+# ============================================================
+
+explanations:
+  enabled: true
+
+  components:
+    - tas
+    - fraud_attack_score
+    - verification_score
+    - persistence_score
+    - acceleration_score
+    - breadth_score
+    - materiality_score
+    - corroboration_score
+
+  include:
+    detection_time: true
+    peak_time: true
+    event_duration: true
+    expected_fraud_amount: true
+    spike_ratio: true
+    transaction_count: true
+    unique_cards: true
+    new_cards: true
+    window_count: true
+    verification_path: true
+
+
+# ============================================================
+# EVALUATION
+# ============================================================
+
+evaluation:
+  enabled: true
+
+  transaction_level:
+    enabled: true
+
+  event_level:
+    enabled: true
+
+  # Event matching must not reuse one truth event multiple times.
+  one_to_one_matching: true
+
+  matching_tolerance_minutes: 60
+
+  compute_business_metrics: true
+
+  metrics:
+    - precision
+    - recall
+    - f1
+    - roc_auc
+    - pr_auc
+    - brier_score
+    - fraud_amount_capture_rate
+    - fraud_loss_prevented
+    - false_positive_amount
+    - missed_fraud_amount
+
+
+# ============================================================
+# RUNTIME VALIDATION
+# ============================================================
+
+runtime:
+  fail_on_missing_required_column: true
+  fail_on_nan_detector_score: true
+  fail_on_infinite_detector_score: true
+
+  enforce_score_bounds: true
+  enforce_weight_sum: true
+
+  # These flags are specifically intended to prevent the
+  # verification bug identified during Phase-2 audit.
+  enforce_verified_tas_gate: true
+  enforce_critical_tas_gate: true
+  enforce_verified_materiality_gate: true
+  enforce_critical_materiality_gate: true
+
+  log_component_activation: true
+  log_threshold_summary: true
+  log_event_summary: true
+
+  # Record effective configuration in metadata.
+  write_effective_config: true
+
+
+# ============================================================
+# OUTPUTS
+# ============================================================
+
+output:
+  root: artifacts/phase2
+
+  windows_dir: artifacts/phase2/windows
+
+  events_dir: artifacts/phase2/events
+
+  evaluation_dir: artifacts/phase2/evaluation
+
+  metadata_file: artifacts/phase2/run_metadata.json
+
+  event_file: artifacts/phase2/events/fraud_spike_events.csv
+
+  window_file: artifacts/phase2/windows/merchant_spike_windows.csv
+
+  explanation_file: artifacts/phase2/events/fraud_spike_explanations.csv
+
+
+# ============================================================
+# LOGGING
+# ============================================================
+
+logging:
+  level: INFO
+
+  file: artifacts/logs/phase2_v4.log
+

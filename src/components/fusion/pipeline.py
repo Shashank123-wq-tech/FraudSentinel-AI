@@ -117,8 +117,9 @@ def _validate_phase2_events(
     """
     Validate the Phase 2 event artifact.
 
-    An empty event dataframe is valid; however, when rows exist,
-    the event identity and temporal boundaries must be present.
+    An empty event dataframe is valid in principle, although
+    the production pipeline normally expects the artifact to
+    contain event rows.
     """
 
     required = [
@@ -143,6 +144,229 @@ def _validate_phase2_events(
 
 
 # =====================================================================
+# FUSION EVENT BUILDER
+# =====================================================================
+
+def _build_fusion_events(
+    fused_transactions: pd.DataFrame,
+    phase2_events: pd.DataFrame,
+) -> pd.DataFrame:
+    """
+    Build fusion-level event artifacts.
+
+    Phase 2 is the source of truth for event identity.
+    Fusion enriches those events with transaction-level unified-risk
+    information when a compatible event identifier is available.
+
+    The function intentionally does not assume that Phase 2 calls
+    its identifier `event_id`.
+    """
+
+    if phase2_events is None or phase2_events.empty:
+        return pd.DataFrame()
+
+    events = phase2_events.copy()
+
+    # ------------------------------------------------------------
+    # 1. Detect Phase 2 event identifier
+    # ------------------------------------------------------------
+
+    possible_event_id_columns = [
+        "event_id",
+        "spike_event_id",
+        "fraud_spike_event_id",
+        "event",
+        "episode_id",
+        "spike_id",
+    ]
+
+    phase2_event_id = next(
+        (
+            col
+            for col in possible_event_id_columns
+            if col in events.columns
+        ),
+        None,
+    )
+
+    # ------------------------------------------------------------
+    # 2. If Phase 2 has no event identifier, preserve its
+    #    event artifact rather than crashing Fusion.
+    # ------------------------------------------------------------
+
+    if phase2_event_id is None:
+        events = events.copy()
+
+        events.insert(
+            0,
+            "fusion_event_id",
+            [f"FUSION_EVT_{i:06d}" for i in range(len(events))],
+        )
+
+        events["fusion_event_id_source"] = "generated_from_phase2_row"
+
+        return events
+
+    # ------------------------------------------------------------
+    # 3. Normalize event identifier
+    # ------------------------------------------------------------
+
+    events["fusion_event_id"] = events[phase2_event_id].astype(str)
+
+    events["fusion_event_id_source"] = phase2_event_id
+
+    # ------------------------------------------------------------
+    # 4. Look for an event identifier in fused transactions
+    # ------------------------------------------------------------
+
+    transaction_event_id = next(
+        (
+            col
+            for col in possible_event_id_columns
+            if col in fused_transactions.columns
+        ),
+        None,
+    )
+
+    if transaction_event_id is None:
+        return events
+
+    tx = fused_transactions.copy()
+
+    tx["fusion_event_id"] = tx[transaction_event_id].astype(str)
+
+    # ------------------------------------------------------------
+    # 5. Select only metrics that actually exist
+    # ------------------------------------------------------------
+
+    candidate_metrics = [
+        "amount",
+        "fraud_probability",
+        "unified_risk",
+        "risk_score",
+        "phase1_score",
+        "phase2_score",
+        "spike_score",
+        "tas",
+        "fas",
+        "coordination_score",
+        "expected_fraud_amount",
+        "expected_fraud_count",
+        "predicted_fraud",
+    ]
+
+    available_metrics = [
+        col
+        for col in candidate_metrics
+        if col in tx.columns
+    ]
+
+    # Nothing to aggregate
+    if not available_metrics:
+        return events
+
+    # ------------------------------------------------------------
+    # 6. Build transaction-level event aggregates
+    # ------------------------------------------------------------
+
+    aggregation = {}
+
+    if "amount" in available_metrics:
+        aggregation["amount"] = ["sum", "mean", "max"]
+
+    if "fraud_probability" in available_metrics:
+        aggregation["fraud_probability"] = ["mean", "max"]
+
+    if "unified_risk" in available_metrics:
+        aggregation["unified_risk"] = ["mean", "max"]
+
+    if "risk_score" in available_metrics:
+        aggregation["risk_score"] = ["mean", "max"]
+
+    if "phase1_score" in available_metrics:
+        aggregation["phase1_score"] = ["mean", "max"]
+
+    if "phase2_score" in available_metrics:
+        aggregation["phase2_score"] = ["mean", "max"]
+
+    if "spike_score" in available_metrics:
+        aggregation["spike_score"] = ["mean", "max"]
+
+    if "tas" in available_metrics:
+        aggregation["tas"] = ["mean", "max"]
+
+    if "fas" in available_metrics:
+        aggregation["fas"] = ["mean", "max"]
+
+    if "coordination_score" in available_metrics:
+        aggregation["coordination_score"] = ["mean", "max"]
+
+    if "expected_fraud_amount" in available_metrics:
+        aggregation["expected_fraud_amount"] = ["sum", "mean", "max"]
+
+    if "expected_fraud_count" in available_metrics:
+        aggregation["expected_fraud_count"] = ["sum", "mean", "max"]
+
+    if not aggregation:
+        return events
+
+    summary = (
+        tx.groupby("fusion_event_id")
+        .agg(aggregation)
+        .reset_index()
+    )
+
+    # ------------------------------------------------------------
+    # 7. Flatten MultiIndex columns
+    # ------------------------------------------------------------
+
+    flattened_columns = []
+
+    for column in summary.columns:
+        if isinstance(column, tuple):
+            base, statistic = column
+
+            if statistic:
+                flattened_columns.append(
+                    f"{base}_{statistic}"
+                )
+            else:
+                flattened_columns.append(base)
+        else:
+            flattened_columns.append(column)
+
+    summary.columns = flattened_columns
+
+    # ------------------------------------------------------------
+    # 8. Add transaction count
+    # ------------------------------------------------------------
+
+    transaction_counts = (
+        tx.groupby("fusion_event_id")
+        .size()
+        .reset_index(name="fusion_transaction_count")
+    )
+
+    summary = summary.merge(
+        transaction_counts,
+        on="fusion_event_id",
+        how="left",
+    )
+
+    # ------------------------------------------------------------
+    # 9. Merge Phase 2 events with Fusion evidence
+    # ------------------------------------------------------------
+
+    events = events.merge(
+        summary,
+        on="fusion_event_id",
+        how="left",
+    )
+
+    return events
+
+
+# =====================================================================
 # PIPELINE
 # =====================================================================
 
@@ -156,36 +380,11 @@ def run_fusion_pipeline(
     """
     Execute the complete FraudSentinel AI Risk Fusion pipeline.
 
-    Parameters
-    ----------
-    phase1_path:
-        Phase 1 transaction-risk CSV.
+    Outputs:
 
-    phase2_path:
-        Phase 2 temporal-window CSV.
-
-    phase2_events_path:
-        Phase 2 event CSV.
-
-        If omitted, the pipeline looks for:
-
-            <phase2_path directory>/phase2_events.csv
-
-    output_path:
-        Optional destination for the unified risk CSV.
-
-        If omitted:
-
-            config.output_dir/
-                fraudsentinel_unified_risk.csv
-
-    config:
-        Optional FusionConfig.
-
-    Returns
-    -------
-    pd.DataFrame
-        Transaction-level unified risk dataframe.
+        fraudsentinel_unified_risk.csv
+        fusion_events.csv
+        fusion_summary.json
     """
 
     # ---------------------------------------------------------------
@@ -193,21 +392,28 @@ def run_fusion_pipeline(
     # ---------------------------------------------------------------
 
     config = config or FusionConfig()
-    
 
-    phase1_path = Path(phase1_path)
-    phase2_path = Path(phase2_path)
+    phase1_path = Path(
+        phase1_path
+    )
+
+    phase2_path = Path(
+        phase2_path
+    )
 
     # ---------------------------------------------------------------
     # Resolve Phase 2 events path
     # ---------------------------------------------------------------
 
     if phase2_events_path is None:
+
         phase2_events_path = (
             phase2_path.parent
             / "phase2_events.csv"
         )
+
     else:
+
         phase2_events_path = Path(
             phase2_events_path
         )
@@ -226,8 +432,6 @@ def run_fusion_pipeline(
         "Phase 2 windows",
     )
 
-    # Phase 2 events are allowed to be empty in principle, but the
-    # artifact should normally exist in the production pipeline.
     phase2_events = _load_csv(
         phase2_events_path,
         "Phase 2 events",
@@ -272,6 +476,7 @@ def run_fusion_pipeline(
     # ---------------------------------------------------------------
 
     if output_path is None:
+
         output_path = (
             config.output_dir
             / "fraudsentinel_unified_risk.csv"
@@ -287,11 +492,30 @@ def run_fusion_pipeline(
     )
 
     # ---------------------------------------------------------------
-    # Save unified artifact
+    # Save unified transaction artifact
     # ---------------------------------------------------------------
 
     result.to_csv(
         output_path,
+        index=False,
+    )
+
+    # ---------------------------------------------------------------
+    # Build Fusion event artifact
+    # ---------------------------------------------------------------
+
+    fusion_events = _build_fusion_events(
+        fused_transactions=result,
+        phase2_events=phase2_events,
+    )
+
+    fusion_events_path = (
+        output_path.parent
+        / "fusion_events.csv"
+    )
+
+    fusion_events.to_csv(
+        fusion_events_path,
         index=False,
     )
 
@@ -303,6 +527,25 @@ def run_fusion_pipeline(
         result,
         output_path.parent,
         config,
+    )
+
+    # ---------------------------------------------------------------
+    # Final artifact diagnostics
+    # ---------------------------------------------------------------
+
+    print(
+        f"Fusion transaction artifact: "
+        f"{output_path}"
+    )
+
+    print(
+        f"Fusion event artifact       : "
+        f"{fusion_events_path}"
+    )
+
+    print(
+        f"Fusion events               : "
+        f"{len(fusion_events):,}"
     )
 
     return result
@@ -331,6 +574,7 @@ def _write_summary(
     # ---------------------------------------------------------------
 
     if "spike_state" in df.columns:
+
         state_distribution = (
             df["spike_state"]
             .fillna("NORMAL")
@@ -339,12 +583,15 @@ def _write_summary(
             )
             .to_dict()
         )
+
     else:
+
         state_distribution = {}
 
     state_distribution = {
         str(key): int(value)
-        for key, value in state_distribution.items()
+        for key, value
+        in state_distribution.items()
     }
 
     # ---------------------------------------------------------------
@@ -352,6 +599,7 @@ def _write_summary(
     # ---------------------------------------------------------------
 
     if "risk_band" in df.columns:
+
         risk_distribution = (
             df["risk_band"]
             .fillna("UNKNOWN")
@@ -360,12 +608,15 @@ def _write_summary(
             )
             .to_dict()
         )
+
     else:
+
         risk_distribution = {}
 
     risk_distribution = {
         str(key): int(value)
-        for key, value in risk_distribution.items()
+        for key, value
+        in risk_distribution.items()
     }
 
     # ---------------------------------------------------------------
@@ -373,6 +624,7 @@ def _write_summary(
     # ---------------------------------------------------------------
 
     if "response_action" in df.columns:
+
         response_distribution = (
             df["response_action"]
             .fillna("UNKNOWN")
@@ -381,12 +633,15 @@ def _write_summary(
             )
             .to_dict()
         )
+
     else:
+
         response_distribution = {}
 
     response_distribution = {
         str(key): int(value)
-        for key, value in response_distribution.items()
+        for key, value
+        in response_distribution.items()
     }
 
     # ---------------------------------------------------------------
@@ -394,6 +649,7 @@ def _write_summary(
     # ---------------------------------------------------------------
 
     if "alert_flag" in df.columns:
+
         alert_distribution = (
             df["alert_flag"]
             .fillna(False)
@@ -403,12 +659,15 @@ def _write_summary(
             )
             .to_dict()
         )
+
     else:
+
         alert_distribution = {}
 
     alert_distribution = {
         str(key): int(value)
-        for key, value in alert_distribution.items()
+        for key, value
+        in alert_distribution.items()
     }
 
     # ---------------------------------------------------------------
@@ -496,57 +755,75 @@ def _write_summary(
 
         "component": "Risk Fusion Layer",
 
-        "fusion_version": config.fusion_version,
+        "fusion_version":
+            config.fusion_version,
 
-        "phase1_version": config.phase1_version,
+        "phase1_version":
+            config.phase1_version,
 
-        "phase2_version": config.phase2_version,
+        "phase2_version":
+            config.phase2_version,
 
-        "rows": int(len(df)),
+        "rows":
+            int(len(df)),
 
-        "mean_unified_risk_score": safe_float(
-            "unified_risk_score"
-        ),
+        "mean_unified_risk_score":
+            safe_float(
+                "unified_risk_score"
+            ),
 
-        "median_unified_risk_score": safe_median(
-            "unified_risk_score"
-        ),
+        "median_unified_risk_score":
+            safe_median(
+                "unified_risk_score"
+            ),
 
-        "max_unified_risk_score": safe_max(
-            "unified_risk_score"
-        ),
+        "max_unified_risk_score":
+            safe_max(
+                "unified_risk_score"
+            ),
 
-        "mean_fusion_confidence": safe_float(
-            "fusion_confidence"
-        ),
+        "mean_fusion_confidence":
+            safe_float(
+                "fusion_confidence"
+            ),
 
-        "mean_phase2_confidence": safe_float(
-            "phase2_confidence"
-        ),
+        "mean_phase2_confidence":
+            safe_float(
+                "phase2_confidence"
+            ),
 
-        "total_expected_fraud_exposure": safe_sum(
-            "expected_fraud_exposure"
-        ),
+        "total_expected_fraud_exposure":
+            safe_sum(
+                "expected_fraud_exposure"
+            ),
 
-        "total_transaction_expected_loss": safe_sum(
-            "transaction_expected_loss"
-        ),
+        "total_transaction_expected_loss":
+            safe_sum(
+                "transaction_expected_loss"
+            ),
 
-        "state_distribution": state_distribution,
+        "state_distribution":
+            state_distribution,
 
-        "risk_band_distribution": risk_distribution,
+        "risk_band_distribution":
+            risk_distribution,
 
-        "response_distribution": response_distribution,
+        "response_distribution":
+            response_distribution,
 
-        "alert_distribution": alert_distribution,
+        "alert_distribution":
+            alert_distribution,
 
         "weights": {
-            "phase1": float(
-                config.phase1_weight
-            ),
-            "phase2": float(
-                config.phase2_weight
-            ),
+            "phase1":
+                float(
+                    config.phase1_weight
+                ),
+
+            "phase2":
+                float(
+                    config.phase2_weight
+                ),
         },
     }
 

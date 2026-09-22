@@ -233,9 +233,9 @@ def load_phase1_risk(
     )
 
     print(
-        f"Time range           : "
-        f"{df['timestamp'].min()} → "
-        f"{df['timestamp'].max()}"
+    f"Time range           : "
+    f"{df['timestamp'].min()} -> "
+    f"{df['timestamp'].max()}"
     )
 
     print(

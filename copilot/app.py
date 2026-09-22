@@ -1,9 +1,11 @@
 import streamlit as st
 
-from src.components.copilot.copilot import (
-    FraudSentinelCopilot,
-)
+from src.components.copilot.copilot import FraudSentinelCopilot
 
+
+# ============================================================
+# PAGE CONFIGURATION
+# ============================================================
 
 st.set_page_config(
     page_title="FraudSentinel AI Copilot",
@@ -11,6 +13,10 @@ st.set_page_config(
     layout="wide",
 )
 
+
+# ============================================================
+# HEADER
+# ============================================================
 
 st.title("🛡️ FraudSentinel AI Copilot")
 
@@ -20,6 +26,10 @@ st.caption(
 )
 
 
+# ============================================================
+# SESSION STATE
+# ============================================================
+
 if "messages" not in st.session_state:
     st.session_state.messages = []
 
@@ -27,6 +37,7 @@ if "messages" not in st.session_state:
 if "copilot" not in st.session_state:
 
     try:
+
         st.session_state.copilot = (
             FraudSentinelCopilot()
         )
@@ -40,6 +51,10 @@ if "copilot" not in st.session_state:
         st.stop()
 
 
+# ============================================================
+# SIDEBAR
+# ============================================================
+
 with st.sidebar:
 
     st.header("System")
@@ -50,9 +65,11 @@ with st.sidebar:
 
     st.caption(
         "The Copilot retrieves evidence from "
-        "the existing API before generating "
-        "an explanation."
+        "the existing FraudSentinel API before "
+        "generating an explanation."
     )
+
+    st.divider()
 
     if st.button(
         "Clear conversation",
@@ -63,6 +80,10 @@ with st.sidebar:
 
         st.rerun()
 
+
+# ============================================================
+# DISPLAY CONVERSATION HISTORY
+# ============================================================
 
 for message in st.session_state.messages:
 
@@ -75,12 +96,24 @@ for message in st.session_state.messages:
         )
 
 
+# ============================================================
+# CHAT INPUT
+# ============================================================
+
 question = st.chat_input(
     "Ask FraudSentinel about risk, spikes, XAI, impact or response..."
 )
 
 
+# ============================================================
+# PROCESS QUESTION
+# ============================================================
+
 if question:
+
+    # --------------------------------------------------------
+    # Store user message
+    # --------------------------------------------------------
 
     st.session_state.messages.append(
         {
@@ -90,7 +123,13 @@ if question:
     )
 
     with st.chat_message("user"):
+
         st.markdown(question)
+
+
+    # --------------------------------------------------------
+    # Assistant response
+    # --------------------------------------------------------
 
     with st.chat_message("assistant"):
 
@@ -99,6 +138,10 @@ if question:
         ):
 
             try:
+
+                # ------------------------------------------------
+                # Preserve previous conversation
+                # ------------------------------------------------
 
                 history = [
                     {
@@ -109,30 +152,112 @@ if question:
                     in st.session_state.messages[:-1]
                 ]
 
+
+                # ------------------------------------------------
+                # Call Copilot
+                #
+                # IMPORTANT:
+                # FraudSentinelCopilot.ask() expects
+                # `conversation`, not `conversation_history`.
+                # ------------------------------------------------
+
                 result = (
                     st.session_state
                     .copilot
                     .ask(
-                        question,
-                        conversation_history=history,
+                        question=question,
+                        conversation=history,
                     )
                 )
 
-                answer = result["answer"]
+
+                # ------------------------------------------------
+                # Extract answer
+                # ------------------------------------------------
+
+                answer = result.get(
+                    "answer",
+                    "No answer was generated.",
+                )
 
                 st.markdown(answer)
+
+
+                # ------------------------------------------------
+                # Evidence
+                # ------------------------------------------------
+
+                evidence_context = result.get(
+                    "evidence_context",
+                    {},
+                )
 
                 with st.expander(
                     "🔎 Evidence retrieved"
                 ):
 
-                    st.json(
-                        result["evidence_context"]
-                    )
+                    if evidence_context:
+
+                        st.json(
+                            evidence_context
+                        )
+
+                    else:
+
+                        st.info(
+                            "No evidence was returned."
+                        )
+
+
+                # ------------------------------------------------
+                # Metadata
+                # ------------------------------------------------
+
+                model_name = result.get(
+                    "model",
+                    "unknown",
+                )
+
+                intent = result.get(
+                    "intent",
+                    "general",
+                )
+
+                route_confidence = result.get(
+                    "route_confidence",
+                    0.0,
+                )
+
+                tools_used = result.get(
+                    "tools_used",
+                    [],
+                )
+
 
                 st.caption(
-                    f"Model: {result['model']}"
+                    f"Model: {model_name}"
                 )
+
+                st.caption(
+                    f"Intent: {intent} | "
+                    f"Route confidence: "
+                    f"{float(route_confidence):.2f}"
+                )
+
+                if tools_used:
+
+                    st.caption(
+                        "Tools used: "
+                        + ", ".join(
+                            str(tool)
+                            for tool in tools_used
+                        )
+                    )
+
+
+                # ------------------------------------------------
+                # Store assistant answer
+                # ------------------------------------------------
 
                 st.session_state.messages.append(
                     {
@@ -141,7 +266,12 @@ if question:
                     }
                 )
 
+
             except Exception as exc:
+
+                # ------------------------------------------------
+                # Display error
+                # ------------------------------------------------
 
                 error_message = (
                     f"Copilot request failed: {exc}"
@@ -150,6 +280,11 @@ if question:
                 st.error(
                     error_message
                 )
+
+
+                # ------------------------------------------------
+                # Store error in conversation
+                # ------------------------------------------------
 
                 st.session_state.messages.append(
                     {
